@@ -1,116 +1,136 @@
 import time
 from machine import Pin, I2C, UART
-from pico_car import SSD1306_I2C, pico_car, ir, ultrasonic
+from pico_car import SSD1306_I2C, pico_car, ultrasonic
 
-# --- INICIALIZÁLÁS ---
-uart = UART(0, 9600, bits=8, parity=None, stop=1, tx=Pin(16), rx=Pin(17))
-print("Bluetooth inicializalasa (5s)...")
-time.sleep(5) 
+# ═══════════════════════════════════════════════
+#  KONSTANSOK
+# ═══════════════════════════════════════════════
 
-i2c = I2C(1, scl=Pin(15), sda=Pin(14), freq=100000)
-oled = SSD1306_I2C(128, 32, i2c)
+UART_BAUD   = 9600
+UART_TX_PIN = 16
+UART_RX_PIN = 17
+I2C_SCL_PIN = 15
+I2C_SDA_PIN = 14
+
+BASE_SPEED  = 150
+DRIVE_TIME  = 0.5   # mp – egyenes
+TURN_TIME   = 0.18  # mp – kanyar
+STEP_PAUSE  = 0.2   # mp – lépések között
+OBSTACLE_CM = 5    # cm – megállási távolság
+OFFSET_STEP = 5     # trim lépésköz
+
+BT_NOISE = {"+CONNECTED", "+DISCONNECT", "+READY", "READY"}
+
+# ═══════════════════════════════════════════════
+#  HARDVER
+# ═══════════════════════════════════════════════
+
+uart  = UART(0, UART_BAUD, bits=8, parity=None, stop=1,
+             tx=Pin(UART_TX_PIN), rx=Pin(UART_RX_PIN))
+i2c   = I2C(1, scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN), freq=100_000)
+oled  = SSD1306_I2C(128, 32, i2c)
 motor = pico_car()
 sonar = ultrasonic()
 
-# Változók
-sequence = []     
-offset = 0        
-base_speed = 150  
+# ═══════════════════════════════════════════════
+#  ÁLLAPOT
+# ═══════════════════════════════════════════════
 
-def update_oled(status_msg="parancsolj:)"):
+sequence = []
+offset   = 0
+
+# ═══════════════════════════════════════════════
+#  KIJELZŐ
+# ═══════════════════════════════════════════════
+
+def update_oled(raw_msg=""):
+    seq_preview = "".join(sequence)[-12:]
     oled.fill(0)
-    oled.text("Tanulo Robot", 16, 0)
-    seq_str = "".join(sequence)[-10:]
-    oled.text("Seq:" + seq_str + " T:" + str(offset), 0, 12)
-    oled.text(status_msg, 0, 24)
+    oled.text("S:" + seq_preview,     0,  0)
+    oled.text("trim: " + str(offset), 0, 11)
+    if raw_msg:
+        oled.text(">" + raw_msg[:14], 0, 24)
     oled.show()
 
+def show_obstacle():
+    oled.fill(0)
+    oled.text("!!!!!!!!!!", 20,  0)
+    oled.text("AKADALY!",   32, 12)
+    oled.text("!!!!!!!!!!", 20, 24)
+    oled.show()
+
+# ═══════════════════════════════════════════════
+#  MOZGÁS
+# ═══════════════════════════════════════════════
+
 def execute_sequence():
-    global sequence, offset, base_speed
-    
     if not sequence:
-        update_oled("Ures lista!")
-        time.sleep(1)
         return
 
-    update_oled("Futtatas...")
-    
-    left_v = max(0, min(255, base_speed - offset))
-    right_v = max(0, min(255, base_speed + offset))
+    lv = max(0, min(255, BASE_SPEED - offset))
+    rv = max(0, min(255, BASE_SPEED + offset))
 
     for step in sequence:
-        dist = sonar.Distance()
-        if 0 < dist <= 15:
+        if 0 < sonar.Distance() <= OBSTACLE_CM:
             motor.Car_Stop()
-            update_oled("AKADALY! STOP")
+            show_obstacle()
             time.sleep(2)
             break
-        
-        if step == 'F':
-            motor.Car_Run(left_v, right_v)
-            time.sleep(0.5)
-        elif step == 'B':
-            motor.Car_Back(left_v, right_v)
-            time.sleep(0.5)
-        elif step == 'L':
-            motor.Car_Left(150, 150)
-            time.sleep(0.15) 
-        elif step == 'R':
-            motor.Car_Right(150, 150)
-            time.sleep(0.15) 
-        
-        motor.Car_Stop()
-        time.sleep(0.2)
 
-    update_oled("Kesz!")
-    time.sleep(1.5)
+        if   step == 'F': motor.Car_Run(lv, rv);                   time.sleep(DRIVE_TIME)
+        elif step == 'B': motor.Car_Back(lv, rv);                  time.sleep(DRIVE_TIME)
+        elif step == 'L': motor.Car_Left(BASE_SPEED, BASE_SPEED);  time.sleep(TURN_TIME)
+        elif step == 'R': motor.Car_Right(BASE_SPEED, BASE_SPEED); time.sleep(TURN_TIME)
+
+        motor.Car_Stop()
+        time.sleep(STEP_PAUSE)
+
+    update_oled()
+
+# ═══════════════════════════════════════════════
+#  PARANCSOK
+# ═══════════════════════════════════════════════
+
+def is_bt_noise(msg):
+    return any(noise in msg for noise in BT_NOISE)
+
+def handle_char(char):
+    global offset
+    if   char in 'FBLR': sequence.append(char)
+    elif char == 'E':     execute_sequence()
+    elif char == 'C':     sequence.clear()
+    elif char == 'D':
+        if sequence: sequence.pop()
+    elif char == '+':     offset += OFFSET_STEP
+    elif char == '-':     offset -= OFFSET_STEP
+
+def process_uart():
+    if not uart.any():
+        return
+    try:
+        raw = uart.read().decode('utf-8').strip()
+        msg = raw.upper()
+        update_oled(raw_msg=raw)
+        if is_bt_noise(msg):
+            return
+        for char in msg:
+            handle_char(char)
+        update_oled(raw_msg=raw)
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════
+#  INDULÁS
+# ═══════════════════════════════════════════════
 
 update_oled()
-print("Rendszer kesz, varom a parancsokat!")
-
-# Puffer ürítése induláskor
-while uart.any() > 0:
+while uart.any():
     uart.read()
 
-while True:
-    changed = False
-    
-    if uart.any() > 0:
-        try:
-            raw_data = uart.read()
-            msg = raw_data.decode('utf-8').strip().upper()
-            
-            # --- ÚJ: RENDSZERÜZENETEK KISZŰRÉSE ---
-            # Ha az üzenet tartalmazza a CONN (Connected) vagy DISC (Disconnected) szót,
-            # vagy +-al kezdődik de hosszabb 1 karakternél (pl. +AT), akkor eldobjuk!
-            if "CONN" in msg or "DISC" in msg or (msg.startswith('+') and len(msg) > 1):
-                print("Rendszeruzenet kiszurve:", msg)
-                continue
-            
-            # Ha a szűrőn átjutott, akkor az az én parancsom
-            for char in msg:
-                if char in 'FBLR': 
-                    sequence.append(char)
-                    changed = True
-                elif char == 'E':    
-                    execute_sequence()
-                    changed = True
-                elif char == 'C':    
-                    sequence = []
-                    changed = True
-                elif char == 'D':    
-                    if sequence: sequence.pop()
-                    changed = True
-                elif char == '+':    
-                    offset += 1
-                    changed = True
-                elif char == '-':    
-                    offset -= 1
-                    changed = True
-        except:
-            pass
+# ═══════════════════════════════════════════════
+#  FŐCIKLUS
+# ═══════════════════════════════════════════════
 
-    if changed:
-        update_oled()
-    
+while True:
+    process_uart()
     time.sleep(0.1)
